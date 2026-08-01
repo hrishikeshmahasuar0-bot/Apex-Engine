@@ -951,9 +951,7 @@ int main()
         if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS) {
             carBody->velocity += glm::vec3(10.0f, 0.0f, 0.0f) * deltaTime;
         }
-        if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) {
-            carBody->velocity.y = 15.0f;
-        }
+        
 
         // Physics
         physics.update(deltaTime);
