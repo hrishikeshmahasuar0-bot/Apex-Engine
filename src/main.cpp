@@ -11,15 +11,87 @@
 #include <vector>
 #include <map>
 #include <cfloat>
+#include <algorithm>
 
 // ==================== STRUCTS ====================
 
+// AABB - Axis Aligned Bounding Box
+struct AABB {
+    glm::vec3 min;
+    glm::vec3 max;
+    
+    AABB() : min(FLT_MAX), max(-FLT_MAX) {}
+    AABB(const glm::vec3& min, const glm::vec3& max) : min(min), max(max) {}
+    
+    glm::vec3 getCenter() const { return (min + max) * 0.5f; }
+    glm::vec3 getSize() const { return max - min; }
+    
+    void expand(const glm::vec3& point) {
+        min = glm::min(min, point);
+        max = glm::max(max, point);
+    }
+    
+    void expand(const AABB& other) {
+        min = glm::min(min, other.min);
+        max = glm::max(max, other.max);
+    }
+    
+    bool intersects(const AABB& other) const {
+        return (min.x <= other.max.x && max.x >= other.min.x) &&
+               (min.y <= other.max.y && max.y >= other.min.y) &&
+               (min.z <= other.max.z && max.z >= other.min.z);
+    }
+    
+    bool containsPoint(const glm::vec3& point) const {
+        return point.x >= min.x && point.x <= max.x &&
+               point.y >= min.y && point.y <= max.y &&
+               point.z >= min.z && point.z <= max.z;
+    }
+};
+
+// Physics Body
+struct RigidBody {
+    glm::vec3 position;
+    glm::vec3 velocity;
+    float mass;
+    float restitution;  // Bounciness (0-1)
+    AABB aabb;
+    AABB aabbWorld;
+    bool isStatic;
+    bool isGrounded;
+    bool isTrigger;
+    
+    RigidBody() : 
+        position(0.0f),
+        velocity(0.0f),
+        mass(1.0f),
+        restitution(0.5f),
+        isStatic(false),
+        isGrounded(false),
+        isTrigger(false) {}
+    
+    void updateAABB() {
+        aabbWorld.min = aabb.min + position;
+        aabbWorld.max = aabb.max + position;
+    }
+};
+
+// Collision Info
+struct Collision {
+    RigidBody* a;
+    RigidBody* b;
+    glm::vec3 normal;
+    float depth;
+};
+
+// OBJ Face
 struct OBJFace {
     std::vector<int> vIndices;
     std::vector<int> vtIndices;
     std::vector<int> vnIndices;
 };
 
+// Material
 struct Material {
     std::string name;
     glm::vec3 ambient;
@@ -43,22 +115,146 @@ struct Material {
         illumModel(1) {}
 };
 
+// OBJ Group with AABB
 struct OBJGroup {
     std::string name;
     std::string materialName;
     std::vector<GLuint> indices;
+    AABB aabb;
+    glm::vec3 center;
+    float radius;
 };
 
-// ==================== GLOBAL VARIABLES FOR CAMERA ====================
-glm::vec3 cameraPos = glm::vec3(0.0f, 60.0f, 300.0f);
-glm::vec3 cameraFront = glm::vec3(0.0f, 0.0f, -1.0f);
-glm::vec3 cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
-float cameraYaw = -90.0f;
-float cameraPitch = 0.0f;
-float cameraSpeed = 50.0f;
-float mouseSensitivity = 0.1f;
-bool firstMouse = true;
-float lastX = 400.0f, lastY = 400.0f;
+// ==================== PHYSICS WORLD ====================
+
+class PhysicsWorld {
+private:
+    std::vector<RigidBody*> bodies;
+    glm::vec3 gravity;
+    float fixedDeltaTime;
+    
+public:
+    PhysicsWorld() : gravity(0.0f, -9.81f, 0.0f), fixedDeltaTime(1.0f / 60.0f) {}
+    
+    void addBody(RigidBody* body) {
+        bodies.push_back(body);
+    }
+    
+    void removeBody(RigidBody* body) {
+        auto it = std::find(bodies.begin(), bodies.end(), body);
+        if (it != bodies.end()) {
+            bodies.erase(it);
+        }
+    }
+    
+    void setGravity(const glm::vec3& g) { gravity = g; }
+    glm::vec3 getGravity() const { return gravity; }
+    
+    void update(float deltaTime) {
+        float accumulator = 0.0f;
+        accumulator += deltaTime;
+        
+        while (accumulator >= fixedDeltaTime) {
+            step();
+            accumulator -= fixedDeltaTime;
+        }
+    }
+    
+    // Get all bodies (for debug rendering)
+    const std::vector<RigidBody*>& getBodies() const { return bodies; }
+    
+private:
+    void step() {
+        // 1. Apply forces (gravity)
+        for (auto* body : bodies) {
+            if (!body->isStatic) {
+                body->velocity += gravity * fixedDeltaTime;
+            }
+        }
+        
+        // 2. Integrate positions
+        for (auto* body : bodies) {
+            if (!body->isStatic) {
+                body->position += body->velocity * fixedDeltaTime;
+            }
+            body->updateAABB();
+        }
+        
+        // 3. Detect and resolve collisions
+        for (size_t i = 0; i < bodies.size(); i++) {
+            for (size_t j = i + 1; j < bodies.size(); j++) {
+                RigidBody* a = bodies[i];
+                RigidBody* b = bodies[j];
+                
+                if (a->isStatic && b->isStatic) continue;
+                if (a->isTrigger || b->isTrigger) continue;
+                
+                if (a->aabbWorld.intersects(b->aabbWorld)) {
+                    resolveCollision(a, b);
+                }
+            }
+        }
+    }
+    
+    void resolveCollision(RigidBody* a, RigidBody* b) {
+        // Calculate overlap on each axis
+        glm::vec3 overlap;
+        overlap.x = std::min(a->aabbWorld.max.x - b->aabbWorld.min.x,
+                            b->aabbWorld.max.x - a->aabbWorld.min.x);
+        overlap.y = std::min(a->aabbWorld.max.y - b->aabbWorld.min.y,
+                            b->aabbWorld.max.y - a->aabbWorld.min.y);
+        overlap.z = std::min(a->aabbWorld.max.z - b->aabbWorld.min.z,
+                            b->aabbWorld.max.z - a->aabbWorld.min.z);
+        
+        // Find smallest overlap axis (collision normal)
+        glm::vec3 normal;
+        float depth;
+        
+        if (overlap.x < overlap.y && overlap.x < overlap.z) {
+            normal = glm::vec3(1.0f, 0.0f, 0.0f);
+            depth = overlap.x;
+        } else if (overlap.y < overlap.z) {
+            normal = glm::vec3(0.0f, 1.0f, 0.0f);
+            depth = overlap.y;
+        } else {
+            normal = glm::vec3(0.0f, 0.0f, 1.0f);
+            depth = overlap.z;
+        }
+        
+        // Push bodies apart
+        float totalMass = a->mass + b->mass;
+        
+        if (!a->isStatic) {
+            a->position -= normal * depth * (b->mass / totalMass);
+        }
+        if (!b->isStatic) {
+            b->position += normal * depth * (a->mass / totalMass);
+        }
+        
+        // Update AABBs
+        a->updateAABB();
+        b->updateAABB();
+        
+        // Velocity resolution (bounce)
+        glm::vec3 relativeVelocity = a->velocity - b->velocity;
+        float velAlongNormal = glm::dot(relativeVelocity, normal);
+        
+        if (velAlongNormal < 0.0f) {
+            float e = (a->restitution + b->restitution) * 0.5f;
+            float impulseMagnitude = -(1.0f + e) * velAlongNormal / (1.0f/a->mass + 1.0f/b->mass);
+            glm::vec3 impulse = impulseMagnitude * normal;
+            
+            if (!a->isStatic) a->velocity += impulse / a->mass;
+            if (!b->isStatic) b->velocity -= impulse / b->mass;
+            
+            // Ground check
+            if (normal.y > 0.5f) {
+                a->isGrounded = true;
+                b->isGrounded = true;
+            }
+        }
+    }
+};
 
 // ==================== FUNCTION DECLARATIONS ====================
 
@@ -71,18 +267,18 @@ void loadOBJ(const char* filepath,
              std::vector<glm::vec2>* outUVs = nullptr,
              std::vector<glm::vec3>* outNormals = nullptr,
              std::map<std::string, Material>* outMaterials = nullptr,
-             std::vector<OBJGroup>* outGroups = nullptr);
+             std::vector<OBJGroup>* outGroups = nullptr,
+             AABB* outOverallAABB = nullptr);
 
 void generateNormals(const std::vector<glm::vec3>& vertices, 
                      const std::vector<GLuint>& indices, 
                      std::vector<glm::vec3>& outNormals);
 
+void calculateGroupAABB(const std::vector<glm::vec3>& vertices, OBJGroup& group);
+
 void setMaterialUniforms(GLuint shaderProgram, const Material& material);
 void setLightingUniforms(GLuint shaderProgram, const glm::vec3& lightPos, 
                          const glm::vec3& lightColor, const glm::vec3& viewPos);
-
-void mouseCallback(GLFWwindow* window, double xpos, double ypos);
-void processInput(GLFWwindow* window, float deltaTime);
 
 // ==================== FUNCTION IMPLEMENTATIONS ====================
 
@@ -138,6 +334,27 @@ void generateNormals(const std::vector<glm::vec3>& vertices,
     }
     
     std::cout << "Generated " << outNormals.size() << " normals" << std::endl;
+}
+
+void calculateGroupAABB(const std::vector<glm::vec3>& vertices, OBJGroup& group) {
+    group.aabb = AABB();
+    if (group.indices.empty()) return;
+    
+    for (GLuint idx : group.indices) {
+        if (idx < vertices.size()) {
+            group.aabb.expand(vertices[idx]);
+        }
+    }
+    
+    group.center = group.aabb.getCenter();
+    float maxDist = 0.0f;
+    for (GLuint idx : group.indices) {
+        if (idx < vertices.size()) {
+            float dist = glm::distance(vertices[idx], group.center);
+            maxDist = std::max(maxDist, dist);
+        }
+    }
+    group.radius = maxDist;
 }
 
 void setMaterialUniforms(GLuint shaderProgram, const Material& material) {
@@ -233,7 +450,8 @@ void loadOBJ(const char* filepath,
              std::vector<glm::vec2>* outUVs,
              std::vector<glm::vec3>* outNormals,
              std::map<std::string, Material>* outMaterials,
-             std::vector<OBJGroup>* outGroups) {
+             std::vector<OBJGroup>* outGroups,
+             AABB* outOverallAABB) {
     
     std::ifstream file(filepath);
     if (!file.is_open()) {
@@ -251,6 +469,9 @@ void loadOBJ(const char* filepath,
     std::string currentMaterial = "";
     OBJGroup group;
     group.name = "default";
+    
+    AABB overallAABB;
+    bool hasGeometry = false;
     
     std::string mtlPath;
     std::string baseDir = filepath;
@@ -273,6 +494,8 @@ void loadOBJ(const char* filepath,
             float x, y, z;
             if (sscanf(line.c_str(), "v %f %f %f", &x, &y, &z) == 3) {
                 tempPositions.push_back(glm::vec3(x, y, z));
+                overallAABB.expand(glm::vec3(x, y, z));
+                hasGeometry = true;
             }
         }
         else if (line[0] == 'v' && line[1] == 't') {
@@ -299,17 +522,20 @@ void loadOBJ(const char* filepath,
             }
         }
         else if (line[0] == 'o' && line[1] == ' ') {
+            if (outGroups && !group.indices.empty()) {
+                calculateGroupAABB(outVertices, group);
+                outGroups->push_back(group);
+                group.indices.clear();
+            }
+            
             currentGroup = line.substr(2);
             currentGroup.erase(0, currentGroup.find_first_not_of(" \t"));
             currentGroup.erase(currentGroup.find_last_not_of(" \t") + 1);
             
             if (outGroups) {
-                if (!group.indices.empty()) {
-                    outGroups->push_back(group);
-                }
                 group.name = currentGroup;
                 group.materialName = currentMaterial;
-                group.indices.clear();
+                group.aabb = AABB();
             }
         }
         else if (line.substr(0, 6) == "usemtl") {
@@ -318,11 +544,13 @@ void loadOBJ(const char* filepath,
             currentMaterial.erase(currentMaterial.find_last_not_of(" \t") + 1);
             
             if (outGroups && !group.indices.empty()) {
+                calculateGroupAABB(outVertices, group);
                 outGroups->push_back(group);
                 group.indices.clear();
             }
             if (outGroups) {
                 group.materialName = currentMaterial;
+                group.aabb = AABB();
             }
         }
         else if (line[0] == 'f' && line[1] == ' ') {
@@ -386,7 +614,19 @@ void loadOBJ(const char* filepath,
     file.close();
     
     if (outGroups && !group.indices.empty()) {
+        calculateGroupAABB(outVertices, group);
         outGroups->push_back(group);
+    }
+    
+    if (outOverallAABB && hasGeometry) {
+        *outOverallAABB = overallAABB;
+        std::cout << "Overall AABB:" << std::endl;
+        std::cout << "  Min: " << overallAABB.min.x << ", " 
+                  << overallAABB.min.y << ", " << overallAABB.min.z << std::endl;
+        std::cout << "  Max: " << overallAABB.max.x << ", " 
+                  << overallAABB.max.y << ", " << overallAABB.max.z << std::endl;
+        std::cout << "  Size: " << overallAABB.getSize().x << " x " 
+                  << overallAABB.getSize().y << " x " << overallAABB.getSize().z << std::endl;
     }
     
     std::cout << "Parsed " << tempPositions.size() << " positions, "
@@ -443,7 +683,17 @@ void loadOBJ(const char* filepath,
     }
 }
 
-// ==================== CAMERA FUNCTIONS ====================
+// ==================== CAMERA CONTROLS ====================
+
+glm::vec3 cameraPos = glm::vec3(0.0f, 60.0f, 300.0f);
+glm::vec3 cameraFront = glm::vec3(0.0f, 0.0f, -1.0f);
+glm::vec3 cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
+float cameraYaw = -90.0f;
+float cameraPitch = 0.0f;
+float cameraSpeed = 50.0f;
+float mouseSensitivity = 0.1f;
+bool firstMouse = true;
+float lastX = 400.0f, lastY = 400.0f;
 
 void mouseCallback(GLFWwindow* window, double xpos, double ypos) {
     if (firstMouse) {
@@ -453,7 +703,7 @@ void mouseCallback(GLFWwindow* window, double xpos, double ypos) {
     }
 
     float xoffset = xpos - lastX;
-    float yoffset = lastY - ypos; // reversed since y-coordinates go from bottom to top
+    float yoffset = lastY - ypos;
     lastX = xpos;
     lastY = ypos;
 
@@ -489,19 +739,11 @@ void processInput(GLFWwindow* window, float deltaTime) {
     if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS)
         cameraPos -= speed * cameraUp;
     
-    // Speed controls
-    if (glfwGetKey(window, GLFW_KEY_KP_ADD) == GLFW_PRESS)
-        cameraSpeed += 10.0f;
-    if (glfwGetKey(window, GLFW_KEY_KP_SUBTRACT) == GLFW_PRESS)
-        cameraSpeed = std::max(10.0f, cameraSpeed - 10.0f);
-    
-    // Reset camera
     if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS) {
         cameraPos = glm::vec3(0.0f, 60.0f, 300.0f);
         cameraFront = glm::vec3(0.0f, 0.0f, -1.0f);
         cameraYaw = -90.0f;
         cameraPitch = 0.0f;
-        cameraSpeed = 50.0f;
     }
 }
 
@@ -515,26 +757,22 @@ int main()
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(800, 800, "Graphics Engine", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(800, 800, "Physics Engine", NULL, NULL);
     if (window == NULL) {
         std::cout << "Failed to create GLFW window" << std::endl;
         glfwTerminate();
         return -1;
     }
     glfwMakeContextCurrent(window);
-
-    // Set mouse callback
     glfwSetCursorPosCallback(window, mouseCallback);
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
     gladLoadGL();
     glViewport(0, 0, 800, 800);
-
-    // Enable depth testing
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
 
-    // Read and compile shaders
+    // Load shaders
     std::string vertexShaderSource = readShaderFile("shaders/vertshader.vert");
     std::string fragmentShaderSource = readShaderFile("shaders/fragshader.frag");
 
@@ -561,13 +799,14 @@ int main()
     glDeleteShader(vertexShader);
     glDeleteShader(fragmentShader);
 
-    // ====== LOAD THE CAR ======
+    // ====== LOAD OBJ WITH AABB ======
     std::vector<glm::vec3> vertices;
     std::vector<GLuint> indices;
     std::vector<glm::vec2> uvs;
     std::vector<glm::vec3> normals;
     std::map<std::string, Material> materials;
     std::vector<OBJGroup> groups;
+    AABB overallAABB;
     
     loadOBJ("assets/car.obj", 
             vertices, 
@@ -575,36 +814,27 @@ int main()
             &uvs,
             &normals,
             &materials,
-            &groups);
+            &groups,
+            &overallAABB);
 
-    // ====== GENERATE NORMALS SINCE NONE EXIST ======
+    // Generate normals if missing
     if (normals.empty() && !vertices.empty()) {
         std::cout << "Generating normals..." << std::endl;
         generateNormals(vertices, indices, normals);
     }
 
-    // Calculate car center and size
-    glm::vec3 carCenter(0.0f);
-    for (const auto& v : vertices) {
-        carCenter += v;
-    }
-    carCenter /= vertices.size();
+    // Calculate car properties
+    glm::vec3 carCenter = overallAABB.getCenter();
+    float carSize = glm::length(overallAABB.getSize());
 
-    float carSize = 0.0f;
-    for (const auto& v : vertices) {
-        carSize = std::max(carSize, glm::length(v - carCenter));
-    }
+    std::cout << "\n=== Car Info ===" << std::endl;
+    std::cout << "Center: " << carCenter.x << ", " << carCenter.y << ", " << carCenter.z << std::endl;
+    std::cout << "Size: " << carSize << std::endl;
 
-    std::cout << "Car center: " << carCenter.x << ", " << carCenter.y << ", " << carCenter.z << std::endl;
-    std::cout << "Car size: " << carSize << std::endl;
-
-    // Set initial camera position to look at the car
+    // ====== SETUP CAMERA ======
     cameraPos = carCenter + glm::vec3(0.0f, 60.0f, 300.0f);
     cameraFront = glm::normalize(carCenter - cameraPos);
-    cameraYaw = -90.0f;
-    cameraPitch = 0.0f;
-
-    // ====== SETUP PROJECTION (FIXED - DOESN'T CHANGE WITH CAMERA) ======
+    
     glm::mat4 projection = glm::perspective(glm::radians(45.0f), 800.0f/800.0f, 0.1f, 5000.0f);
 
     // ====== CONVERT VERTEX DATA ======
@@ -639,13 +869,11 @@ int main()
 
     glBindVertexArray(VAO);
 
-    // Position
     glBindBuffer(GL_ARRAY_BUFFER, VBO);
     glBufferData(GL_ARRAY_BUFFER, vertexData.size() * sizeof(GLfloat), vertexData.data(), GL_STATIC_DRAW);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, (void*)0);
     glEnableVertexAttribArray(0);
 
-    // Normals
     if (!normalData.empty()) {
         glBindBuffer(GL_ARRAY_BUFFER, NBO);
         glBufferData(GL_ARRAY_BUFFER, normalData.size() * sizeof(GLfloat), normalData.data(), GL_STATIC_DRAW);
@@ -653,7 +881,6 @@ int main()
         glEnableVertexAttribArray(1);
     }
 
-    // UVs
     if (!uvData.empty()) {
         glBindBuffer(GL_ARRAY_BUFFER, UVBO);
         glBufferData(GL_ARRAY_BUFFER, uvData.size() * sizeof(GLfloat), uvData.data(), GL_STATIC_DRAW);
@@ -661,71 +888,102 @@ int main()
         glEnableVertexAttribArray(2);
     }
 
-    // Indices
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(GLuint), indices.data(), GL_STATIC_DRAW);
 
     glBindVertexArray(0);
 
-    // ====== LIGHTING SETUP ======
+    // ====== CREATE PHYSICS WORLD ======
+    PhysicsWorld physics;
+    physics.setGravity(glm::vec3(0.0f, -9.81f, 0.0f));
+
+    // Create car physics body
+    RigidBody* carBody = new RigidBody();
+    carBody->aabb = overallAABB;
+    carBody->position = carCenter;
+    carBody->mass = 1000.0f;
+    carBody->restitution = 0.1f;
+    carBody->updateAABB();
+    physics.addBody(carBody);
+
+    // Create ground
+    RigidBody* ground = new RigidBody();
+    ground->aabb = AABB(glm::vec3(-1000.0f, -10.0f, -1000.0f), 
+                         glm::vec3(1000.0f, 0.0f, 1000.0f));
+    ground->position = glm::vec3(0.0f, 0.0f, 0.0f);
+    ground->isStatic = true;
+    ground->updateAABB();
+    physics.addBody(ground);
+
+    // ====== LIGHTING ======
     glm::vec3 lightPos = glm::vec3(200.0f, 300.0f, 400.0f);
     glm::vec3 lightColor = glm::vec3(1.5f, 1.5f, 1.5f);
 
-    // ====== OVERRIDE MATERIALS TO BE VISIBLE ======
-    for (auto& [name, mat] : materials) {
-        if (name.find("Body") != std::string::npos) {
-            mat.diffuse = glm::vec3(0.9f, 0.2f, 0.1f);   // Red body
-            mat.ambient = glm::vec3(0.3f, 0.1f, 0.05f);
-            mat.specular = glm::vec3(0.5f, 0.5f, 0.5f);
-            mat.shininess = 64.0f;
-            mat.transparency = 1.0f;
-        } else if (name.find("Glass") != std::string::npos) {
-            mat.diffuse = glm::vec3(0.2f, 0.6f, 0.9f);   // Blue glass
-            mat.ambient = glm::vec3(0.05f, 0.1f, 0.3f);
-            mat.specular = glm::vec3(0.8f, 0.8f, 0.8f);
-            mat.shininess = 128.0f;
-            mat.transparency = 0.6f;
-        }
-    }
-
     // ====== MAIN LOOP ======
     float lastFrame = 0.0f;
-    
+    bool showPhysicsDebug = false;
+
     while (!glfwWindowShouldClose(window)) {
         float currentFrame = glfwGetTime();
         float deltaTime = currentFrame - lastFrame;
         lastFrame = currentFrame;
-        
-        // Process input
+
+        // Input
         processInput(window, deltaTime);
-        
+
+        // Toggle physics debug
+        if (glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS) {
+            showPhysicsDebug = !showPhysicsDebug;
+            std::cout << "Physics Debug: " << (showPhysicsDebug ? "ON" : "OFF") << std::endl;
+            glfwWaitEventsTimeout(0.2);
+        }
+
+        // Car controls
+        if (glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS) {
+            carBody->velocity += glm::vec3(0.0f, 0.0f, -10.0f) * deltaTime;
+        }
+        if (glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS) {
+            carBody->velocity += glm::vec3(0.0f, 0.0f, 10.0f) * deltaTime;
+        }
+        if (glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS) {
+            carBody->velocity += glm::vec3(-10.0f, 0.0f, 0.0f) * deltaTime;
+        }
+        if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS) {
+            carBody->velocity += glm::vec3(10.0f, 0.0f, 0.0f) * deltaTime;
+        }
+        if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) {
+            carBody->velocity.y = 15.0f;
+        }
+
+        // Physics
+        physics.update(deltaTime);
+
+        // Render
         glClearColor(0.07f, 0.13f, 0.17f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        
+
         float time = glfwGetTime();
         float angle = time * 0.3f;
 
-        // ====== MODEL MATRIX - FIXED SIZE, DOESN'T CHANGE WITH CAMERA ======
-        float scaleFactor = 0.02f; // Fixed 2% of original size
+        // Model matrix using physics position
+        float scaleFactor = 0.02f;
         glm::mat4 model = glm::mat4(1.0f);
-        model = glm::translate(model, glm::vec3(18.0f, -60.0f, 28.0f)); // Center the car
+        model = glm::translate(model, carBody->position);
         model = glm::scale(model, glm::vec3(scaleFactor));
         model = glm::rotate(model, angle, glm::vec3(0.0f, 1.0f, 0.0f));
-        
-        // ====== VIEW MATRIX - UPDATED WITH CAMERA POSITION ======
+
+        // View matrix
         glm::mat4 view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
-        
+
         glUseProgram(shaderProgram);
-        
-        // Set matrices
+
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(model));
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
-        
-        // Set lighting
+
         setLightingUniforms(shaderProgram, lightPos, lightColor, cameraPos);
-        
-        // Draw
+
+        // Draw car
         glBindVertexArray(VAO);
         
         if (!groups.empty()) {
@@ -735,13 +993,11 @@ int main()
                 if (it != materials.end()) {
                     setMaterialUniforms(shaderProgram, it->second);
                 } else {
-                    // Default fallback
                     Material defaultMat;
                     defaultMat.diffuse = glm::vec3(1.0f, 0.5f, 0.0f);
                     defaultMat.ambient = glm::vec3(0.3f, 0.2f, 0.0f);
                     defaultMat.specular = glm::vec3(0.5f, 0.5f, 0.5f);
                     defaultMat.shininess = 32.0f;
-                    defaultMat.transparency = 1.0f;
                     setMaterialUniforms(shaderProgram, defaultMat);
                 }
                 
@@ -750,17 +1006,28 @@ int main()
                 indexOffset += group.indices.size();
             }
         } else {
-            // No groups, draw with default material
-            Material defaultMat;
-            defaultMat.diffuse = glm::vec3(1.0f, 0.0f, 0.0f); // Red
-            defaultMat.ambient = glm::vec3(0.3f, 0.1f, 0.1f);
-            defaultMat.specular = glm::vec3(0.5f, 0.5f, 0.5f);
-            defaultMat.shininess = 32.0f;
-            defaultMat.transparency = 1.0f;
-            setMaterialUniforms(shaderProgram, defaultMat);
             glDrawElements(GL_TRIANGLES, indices.size(), GL_UNSIGNED_INT, 0);
         }
-        
+
+        // Physics debug rendering (AABB)
+        if (showPhysicsDebug) {
+            // Draw car AABB (green)
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+            
+            // You would draw AABB boxes here
+            // For now, just print position
+            static int frameCount = 0;
+            if (frameCount++ % 60 == 0) {
+                std::cout << "Car pos: " << carBody->position.x << ", " 
+                          << carBody->position.y << ", " << carBody->position.z << std::endl;
+                std::cout << "Car velocity: " << carBody->velocity.x << ", " 
+                          << carBody->velocity.y << ", " << carBody->velocity.z << std::endl;
+                std::cout << "Grounded: " << (carBody->isGrounded ? "YES" : "NO") << std::endl;
+            }
+            
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        }
+
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
