@@ -12,9 +12,9 @@ newmtl _Lamborghini_AventadorLamborghini_Aventador_BodySG
 	Kd 0.0000 0.0000 0.0000
 	Ks 0.0000 0.0000 0.0000
 	Ke 0.0000 0.0000 0.0000
-	map_Ka E:\car\new 1\Lamborginhi_Aventador_OBJ\Lamborginhi Aventador OBJ\Lamborginhi Aventador_diffuse.jpeg
-	map_Kd E:\car\new 1\Lamborginhi_Aventador_OBJ\Lamborginhi Aventador OBJ\Lamborginhi Aventador_diffuse.jpeg
-	map_Ks E:\car\new 1\Lamborginhi_Aventador_OBJ\Lamborginhi Aventador OBJ\Lamborginhi Aventador_spec.jpeg
+	map_Ka Lamborginhi_Aventador_diffuse.jpeg
+	map_Kd Lamborginhi_Aventador_diffuse.jpeg
+	map_Ks Lamborginhi_Aventador_spec.jpeg
 
 newmtl _Lamborghini_AventadorLamborghini_Aventador_GlassSG
 	Ns 4.3100

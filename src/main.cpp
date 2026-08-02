@@ -13,12 +13,23 @@
 #include <cfloat>
 #include <algorithm>
 
+// ====== STB_IMAGE for texture loading ======
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
 // ==================== STRUCTS ====================
 
-// AABB
+// Texture - for loading images
+struct Texture {
+    GLuint id;
+    int width;
+    int height;
+    int channels;
+    
+    Texture() : id(0), width(0), height(0), channels(0) {}
+};
+
+// AABB - Axis Aligned Bounding Box
 struct AABB {
     glm::vec3 min;
     glm::vec3 max;
@@ -34,10 +45,21 @@ struct AABB {
         max = glm::max(max, point);
     }
     
+    void expand(const AABB& other) {
+        min = glm::min(min, other.min);
+        max = glm::max(max, other.max);
+    }
+    
     bool intersects(const AABB& other) const {
         return (min.x <= other.max.x && max.x >= other.min.x) &&
                (min.y <= other.max.y && max.y >= other.min.y) &&
                (min.z <= other.max.z && max.z >= other.min.z);
+    }
+    
+    bool containsPoint(const glm::vec3& point) const {
+        return point.x >= min.x && point.x <= max.x &&
+               point.y >= min.y && point.y <= max.y &&
+               point.z >= min.z && point.z <= max.z;
     }
 };
 
@@ -68,14 +90,22 @@ struct RigidBody {
     }
 };
 
-// Texture
-struct Texture {
-    GLuint id;
-    int width, height, channels;
-    Texture() : id(0), width(0), height(0), channels(0) {}
+// Collision Info
+struct Collision {
+    RigidBody* a;
+    RigidBody* b;
+    glm::vec3 normal;
+    float depth;
 };
 
-// Material with texture
+// OBJ Face
+struct OBJFace {
+    std::vector<int> vIndices;
+    std::vector<int> vtIndices;
+    std::vector<int> vnIndices;
+};
+
+// Material with texture support
 struct Material {
     std::string name;
     glm::vec3 ambient;
@@ -102,14 +132,7 @@ struct Material {
         hasTexture(false) {}
 };
 
-// OBJ Face
-struct OBJFace {
-    std::vector<int> vIndices;
-    std::vector<int> vtIndices;
-    std::vector<int> vnIndices;
-};
-
-// OBJ Group
+// OBJ Group with AABB
 struct OBJGroup {
     std::string name;
     std::string materialName;
@@ -134,7 +157,15 @@ public:
         bodies.push_back(body);
     }
     
+    void removeBody(RigidBody* body) {
+        auto it = std::find(bodies.begin(), bodies.end(), body);
+        if (it != bodies.end()) {
+            bodies.erase(it);
+        }
+    }
+    
     void setGravity(const glm::vec3& g) { gravity = g; }
+    glm::vec3 getGravity() const { return gravity; }
     
     void update(float deltaTime) {
         float accumulator = 0.0f;
@@ -146,16 +177,18 @@ public:
         }
     }
     
+    const std::vector<RigidBody*>& getBodies() const { return bodies; }
+    
 private:
     void step() {
-        // Apply gravity
+        // 1. Apply forces (gravity)
         for (auto* body : bodies) {
             if (!body->isStatic) {
                 body->velocity += gravity * fixedDeltaTime;
             }
         }
         
-        // Update positions
+        // 2. Integrate positions
         for (auto* body : bodies) {
             if (!body->isStatic) {
                 body->position += body->velocity * fixedDeltaTime;
@@ -163,7 +196,7 @@ private:
             body->updateAABB();
         }
         
-        // Collisions
+        // 3. Detect and resolve collisions
         for (size_t i = 0; i < bodies.size(); i++) {
             for (size_t j = i + 1; j < bodies.size(); j++) {
                 RigidBody* a = bodies[i];
@@ -180,6 +213,7 @@ private:
     }
     
     void resolveCollision(RigidBody* a, RigidBody* b) {
+        // Calculate overlap on each axis
         glm::vec3 overlap;
         overlap.x = std::min(a->aabbWorld.max.x - b->aabbWorld.min.x,
                             b->aabbWorld.max.x - a->aabbWorld.min.x);
@@ -188,6 +222,7 @@ private:
         overlap.z = std::min(a->aabbWorld.max.z - b->aabbWorld.min.z,
                             b->aabbWorld.max.z - a->aabbWorld.min.z);
         
+        // Find smallest overlap axis (collision normal)
         glm::vec3 normal;
         float depth;
         
@@ -202,6 +237,7 @@ private:
             depth = overlap.z;
         }
         
+        // Push bodies apart
         float totalMass = a->mass + b->mass;
         
         if (!a->isStatic) {
@@ -211,9 +247,11 @@ private:
             b->position += normal * depth * (a->mass / totalMass);
         }
         
+        // Update AABBs
         a->updateAABB();
         b->updateAABB();
         
+        // Velocity resolution (bounce)
         glm::vec3 relativeVelocity = a->velocity - b->velocity;
         float velAlongNormal = glm::dot(relativeVelocity, normal);
         
@@ -225,6 +263,7 @@ private:
             if (!a->isStatic) a->velocity += impulse / a->mass;
             if (!b->isStatic) b->velocity -= impulse / b->mass;
             
+            // Ground check
             if (normal.y > 0.5f) {
                 a->isGrounded = true;
                 b->isGrounded = true;
@@ -238,10 +277,14 @@ private:
 Texture loadTexture(const char* filepath) {
     Texture texture;
     int width, height, channels;
+    
+    // 3DS MAX FIX: Flip vertically
+    stbi_set_flip_vertically_on_load(true);
+    
     unsigned char* data = stbi_load(filepath, &width, &height, &channels, 0);
     
     if (!data) {
-        std::cout << "Failed to load texture: " << filepath << std::endl;
+        std::cout << "  ERROR: stbi_load failed for: " << filepath << std::endl;
         return texture;
     }
     
@@ -251,19 +294,27 @@ Texture loadTexture(const char* filepath) {
     
     GLenum format;
     if (channels == 1) format = GL_RED;
+    else if (channels == 2) format = GL_RG;
     else if (channels == 3) format = GL_RGB;
     else if (channels == 4) format = GL_RGBA;
+    else format = GL_RGB;
     
     glGenTextures(1, &texture.id);
     glBindTexture(GL_TEXTURE_2D, texture.id);
+    
     glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    
+    // 3DS MAX FIX: Clamp UVs
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     
     stbi_image_free(data);
-    std::cout << "Loaded texture: " << filepath << " (" << width << "x" << height << ")" << std::endl;
+    
+    std::cout << "  Loaded: " << filepath << " (" << width << "x" << height << ", " 
+              << channels << " channels, GL ID: " << texture.id << ")" << std::endl;
+    
     return texture;
 }
 
@@ -284,6 +335,8 @@ void loadOBJ(const char* filepath,
 void generateNormals(const std::vector<glm::vec3>& vertices, 
                      const std::vector<GLuint>& indices, 
                      std::vector<glm::vec3>& outNormals);
+
+void calculateGroupAABB(const std::vector<glm::vec3>& vertices, OBJGroup& group);
 
 void setMaterialUniforms(GLuint shaderProgram, const Material& material);
 void setLightingUniforms(GLuint shaderProgram, const glm::vec3& lightPos, 
@@ -345,6 +398,27 @@ void generateNormals(const std::vector<glm::vec3>& vertices,
     std::cout << "Generated " << outNormals.size() << " normals" << std::endl;
 }
 
+void calculateGroupAABB(const std::vector<glm::vec3>& vertices, OBJGroup& group) {
+    group.aabb = AABB();
+    if (group.indices.empty()) return;
+    
+    for (GLuint idx : group.indices) {
+        if (idx < vertices.size()) {
+            group.aabb.expand(vertices[idx]);
+        }
+    }
+    
+    group.center = group.aabb.getCenter();
+    float maxDist = 0.0f;
+    for (GLuint idx : group.indices) {
+        if (idx < vertices.size()) {
+            float dist = glm::distance(vertices[idx], group.center);
+            maxDist = std::max(maxDist, dist);
+        }
+    }
+    group.radius = maxDist;
+}
+
 void setMaterialUniforms(GLuint shaderProgram, const Material& material) {
     glUniform3fv(glGetUniformLocation(shaderProgram, "materialAmbient"), 1, glm::value_ptr(material.ambient));
     glUniform3fv(glGetUniformLocation(shaderProgram, "materialDiffuse"), 1, glm::value_ptr(material.diffuse));
@@ -382,6 +456,7 @@ void loadMTL(const char* filepath, std::map<std::string, Material>& materials) {
     bool hasMaterial = false;
     
     while (std::getline(file, line)) {
+        // Remove trailing \r
         if (!line.empty() && line[line.length() - 1] == '\r') {
             line.erase(line.length() - 1);
         }
@@ -427,10 +502,40 @@ void loadMTL(const char* filepath, std::map<std::string, Material>& materials) {
                 currentMaterial.transparency = d;
             }
         }
-        else if (line.substr(0, 6) == "map_Kd") {
-            currentMaterial.diffuseMap = line.substr(7);
-            currentMaterial.diffuseMap.erase(0, currentMaterial.diffuseMap.find_first_not_of(" \t"));
-            currentMaterial.diffuseMap.erase(currentMaterial.diffuseMap.find_last_not_of(" \t") + 1);
+        else if (line.substr(0, 2) == "Tr") {
+            float tr;
+            if (sscanf(line.c_str(), "Tr %f", &tr) == 1) {
+                currentMaterial.transparency = 1.0f - tr;
+            }
+        }
+        // ====== FIX: Handle tabs in map_Kd ======
+        else if (line.find("map_Kd") != std::string::npos) {
+            size_t pos = line.find("map_Kd");
+            if (pos != std::string::npos) {
+                std::string value = line.substr(pos + 6);
+                value.erase(0, value.find_first_not_of(" \t"));
+                value.erase(value.find_last_not_of(" \t") + 1);
+                currentMaterial.diffuseMap = value;
+                std::cout << "  Found diffuseMap: '" << value << "'" << std::endl;
+            }
+        }
+        else if (line.find("map_Ks") != std::string::npos) {
+            size_t pos = line.find("map_Ks");
+            if (pos != std::string::npos) {
+                std::string value = line.substr(pos + 6);
+                value.erase(0, value.find_first_not_of(" \t"));
+                value.erase(value.find_last_not_of(" \t") + 1);
+                currentMaterial.specularMap = value;
+            }
+        }
+        else if (line.find("map_Bump") != std::string::npos || line.find("map_Kn") != std::string::npos) {
+            size_t pos = line.find_first_of(" \t");
+            if (pos != std::string::npos) {
+                std::string value = line.substr(pos + 1);
+                value.erase(0, value.find_first_not_of(" \t"));
+                value.erase(value.find_last_not_of(" \t") + 1);
+                currentMaterial.normalMap = value;
+            }
         }
     }
     
@@ -520,6 +625,7 @@ void loadOBJ(const char* filepath,
         }
         else if (line[0] == 'o' && line[1] == ' ') {
             if (outGroups && !group.indices.empty()) {
+                calculateGroupAABB(outVertices, group);
                 outGroups->push_back(group);
                 group.indices.clear();
             }
@@ -531,6 +637,7 @@ void loadOBJ(const char* filepath,
             if (outGroups) {
                 group.name = currentGroup;
                 group.materialName = currentMaterial;
+                group.aabb = AABB();
             }
         }
         else if (line.substr(0, 6) == "usemtl") {
@@ -539,11 +646,13 @@ void loadOBJ(const char* filepath,
             currentMaterial.erase(currentMaterial.find_last_not_of(" \t") + 1);
             
             if (outGroups && !group.indices.empty()) {
+                calculateGroupAABB(outVertices, group);
                 outGroups->push_back(group);
                 group.indices.clear();
             }
             if (outGroups) {
                 group.materialName = currentMaterial;
+                group.aabb = AABB();
             }
         }
         else if (line[0] == 'f' && line[1] == ' ') {
@@ -607,11 +716,19 @@ void loadOBJ(const char* filepath,
     file.close();
     
     if (outGroups && !group.indices.empty()) {
+        calculateGroupAABB(outVertices, group);
         outGroups->push_back(group);
     }
     
     if (outOverallAABB && hasGeometry) {
         *outOverallAABB = overallAABB;
+        std::cout << "Overall AABB:" << std::endl;
+        std::cout << "  Min: " << overallAABB.min.x << ", " 
+                  << overallAABB.min.y << ", " << overallAABB.min.z << std::endl;
+        std::cout << "  Max: " << overallAABB.max.x << ", " 
+                  << overallAABB.max.y << ", " << overallAABB.max.z << std::endl;
+        std::cout << "  Size: " << overallAABB.getSize().x << " x " 
+                  << overallAABB.getSize().y << " x " << overallAABB.getSize().z << std::endl;
     }
     
     std::cout << "Parsed " << tempPositions.size() << " positions, "
@@ -661,6 +778,11 @@ void loadOBJ(const char* filepath,
     
     std::cout << "Generated " << outVertices.size() << " vertices and " 
               << outIndices.size() << " indices" << std::endl;
+    
+    if (outVertices.size() > 0) {
+        std::cout << "First vertex: " << outVertices[0].x << ", " 
+                  << outVertices[0].y << ", " << outVertices[0].z << std::endl;
+    }
 }
 
 // ==================== CAMERA CONTROLS ====================
@@ -731,12 +853,13 @@ void processInput(GLFWwindow* window, float deltaTime) {
 
 int main()
 {
+    // Initialize GLFW
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(800, 800, "Lamborghini Viewer", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(800, 800, "Apex Engine - Lamborghini", NULL, NULL);
     if (window == NULL) {
         std::cout << "Failed to create GLFW window" << std::endl;
         glfwTerminate();
@@ -749,6 +872,7 @@ int main()
     gladLoadGL();
     glViewport(0, 0, 800, 800);
     glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
 
     // Load shaders
     std::string vertexShaderSource = readShaderFile("shaders/vertshader.vert");
@@ -777,7 +901,7 @@ int main()
     glDeleteShader(vertexShader);
     glDeleteShader(fragmentShader);
 
-    // ====== LOAD OBJ ======
+    // ====== LOAD OBJ WITH AABB ======
     std::vector<glm::vec3> vertices;
     std::vector<GLuint> indices;
     std::vector<glm::vec2> uvs;
@@ -795,60 +919,58 @@ int main()
             &groups,
             &overallAABB);
 
-    // ====== GENERATE NORMALS ======
+    // Generate normals if missing
     if (normals.empty() && !vertices.empty()) {
+        std::cout << "Generating normals..." << std::endl;
         generateNormals(vertices, indices, normals);
     }
 
-    // ====== LOAD TEXTURES - FORCE BY FILENAME ======
-std::cout << "\n=== Loading Textures ===" << std::endl;
-
-// List of texture files to try loading
-std::vector<std::string> textureFiles = {
-    "Lamborginhi_Aventador_diffuse.jpeg",
-    "Lamborginhi_Aventador_diffuse.jpg",
-    "Lamborginhi_Aventador_Diffuse.jpeg",
-    "diffuse.jpeg",
-    "texture.jpeg"
-};
-
-for (auto& [name, mat] : materials) {
-    bool textureLoaded = false;
+    // ====== LOAD TEXTURES ======
+    std::cout << "\n=== Loading Textures ===" << std::endl;
     
-    // Try each possible filename
-    for (const auto& filename : textureFiles) {
-        std::string texturePath = "assets/" + filename;
-        std::cout << "Trying: " << texturePath << std::endl;
+    for (auto& [name, mat] : materials) {
+        std::cout << "Material: " << name << std::endl;
+        std::cout << "  diffuseMap from MTL: '" << mat.diffuseMap << "'" << std::endl;
         
-        mat.diffuseTexture = loadTexture(texturePath.c_str());
-        if (mat.diffuseTexture.id != 0) {
-            mat.hasTexture = true;
-            textureLoaded = true;
-            std::cout << "✓ Loaded texture: " << filename << " for " << name << std::endl;
-            break;
-        }
-    }
-    
-    if (!textureLoaded) {
-        std::cout << "✗ No texture found for: " << name << std::endl;
-        // Fallback colors
-        if (name.find("Glass") != std::string::npos) {
-            mat.diffuse = glm::vec3(0.2f, 0.6f, 0.9f);
-            mat.transparency = 0.06f;
+        if (!mat.diffuseMap.empty()) {
+            std::string texturePath = "assets/" + mat.diffuseMap;
+            std::cout << "  Trying to load: " << texturePath << std::endl;
+            
+            mat.diffuseTexture = loadTexture(texturePath.c_str());
+            
+            if (mat.diffuseTexture.id != 0) {
+                mat.hasTexture = true;
+                std::cout << "  ✓ SUCCESS: Texture loaded for " << name << std::endl;
+            } else {
+                std::cout << "  ✗ FAILED: Could not load texture for " << name << std::endl;
+                // Fallback colors
+                if (name.find("Glass") != std::string::npos) {
+                    mat.diffuse = glm::vec3(0.2f, 0.6f, 0.9f);
+                    mat.transparency = 0.06f;
+                } else {
+                    mat.diffuse = glm::vec3(0.9f, 0.2f, 0.1f);
+                }
+            }
         } else {
-            mat.diffuse = glm::vec3(0.9f, 0.2f, 0.1f); // Red
+            std::cout << "  No diffuseMap in MTL, using fallback color" << std::endl;
+            if (name.find("Glass") != std::string::npos) {
+                mat.diffuse = glm::vec3(0.2f, 0.6f, 0.9f);
+                mat.transparency = 0.06f;
+            } else {
+                mat.diffuse = glm::vec3(0.9f, 0.2f, 0.1f);
+            }
         }
     }
-}
 
     // Calculate car properties
     glm::vec3 carCenter = overallAABB.getCenter();
     float carSize = glm::length(overallAABB.getSize());
 
-    std::cout << "Car center: " << carCenter.x << ", " << carCenter.y << ", " << carCenter.z << std::endl;
-    std::cout << "Car size: " << carSize << std::endl;
+    std::cout << "\n=== Car Info ===" << std::endl;
+    std::cout << "Center: " << carCenter.x << ", " << carCenter.y << ", " << carCenter.z << std::endl;
+    std::cout << "Size: " << carSize << std::endl;
 
-    // ====== CAMERA ======
+    // ====== SETUP CAMERA ======
     cameraPos = carCenter + glm::vec3(0.0f, 60.0f, 300.0f);
     cameraFront = glm::normalize(carCenter - cameraPos);
     
@@ -910,10 +1032,11 @@ for (auto& [name, mat] : materials) {
 
     glBindVertexArray(0);
 
-    // ====== PHYSICS ======
+    // ====== CREATE PHYSICS WORLD ======
     PhysicsWorld physics;
     physics.setGravity(glm::vec3(0.0f, -9.81f, 0.0f));
 
+    // Create car physics body
     RigidBody* carBody = new RigidBody();
     carBody->aabb = overallAABB;
     carBody->position = carCenter;
@@ -922,6 +1045,7 @@ for (auto& [name, mat] : materials) {
     carBody->updateAABB();
     physics.addBody(carBody);
 
+    // Create ground
     RigidBody* ground = new RigidBody();
     ground->aabb = AABB(glm::vec3(-1000.0f, -10.0f, -1000.0f), 
                          glm::vec3(1000.0f, 0.0f, 1000.0f));
@@ -936,39 +1060,73 @@ for (auto& [name, mat] : materials) {
 
     // ====== MAIN LOOP ======
     float lastFrame = 0.0f;
+    bool showPhysicsDebug = false;
 
     while (!glfwWindowShouldClose(window)) {
         float currentFrame = glfwGetTime();
         float deltaTime = currentFrame - lastFrame;
         lastFrame = currentFrame;
 
+        // Input
         processInput(window, deltaTime);
 
-        // Car controls
-        if (glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS)
-            carBody->velocity += glm::vec3(0.0f, 0.0f, -10.0f) * deltaTime;
-        if (glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS)
-            carBody->velocity += glm::vec3(0.0f, 0.0f, 10.0f) * deltaTime;
-        if (glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS)
-            carBody->velocity += glm::vec3(-10.0f, 0.0f, 0.0f) * deltaTime;
-        if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS)
-            carBody->velocity += glm::vec3(10.0f, 0.0f, 0.0f) * deltaTime;
-        if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS)
-            carBody->velocity.y = 15.0f;
+        // Toggle physics debug
+        if (glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS) {
+            showPhysicsDebug = !showPhysicsDebug;
+            std::cout << "Physics Debug: " << (showPhysicsDebug ? "ON" : "OFF") << std::endl;
+            glfwWaitEventsTimeout(0.2);
+        }
 
+        // ====== CAR CONTROLS ======
+        float acceleration = 30.0f;  // How fast the car speeds up
+        float maxSpeed = 50.0f;      // Maximum speed
+        float turnSpeed = 20.0f;     // Turning speed
+
+        // Forward / Backward
+        if (glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS) {
+            carBody->velocity += glm::vec3(0.0f, 0.0f, -acceleration) * deltaTime;
+        }
+        if (glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS) {
+            carBody->velocity += glm::vec3(0.0f, 0.0f, acceleration) * deltaTime;
+        }
+
+        // Left / Right (strafe)
+        if (glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS) {
+            carBody->velocity += glm::vec3(-turnSpeed, 0.0f, 0.0f) * deltaTime;
+        }
+        if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS) {
+            carBody->velocity += glm::vec3(turnSpeed, 0.0f, 0.0f) * deltaTime;
+        }
+
+        // Jump
+        if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS && carBody->isGrounded) {
+            carBody->velocity.y = 20.0f;
+            carBody->isGrounded = false;
+        }
+
+        // Clamp speed to maxSpeed
+        float speed = glm::length(carBody->velocity);
+        if (speed > maxSpeed) {
+            carBody->velocity = glm::normalize(carBody->velocity) * maxSpeed;
+        }
+        // Physics
         physics.update(deltaTime);
 
+        // Render
         glClearColor(0.07f, 0.13f, 0.17f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        float angle = glfwGetTime() * 0.3f;
+        float time = glfwGetTime();
+        float angle = time * 0.3f;
 
+        // Model matrix using physics position
         float scaleFactor = 0.02f;
         glm::mat4 model = glm::mat4(1.0f);
         model = glm::translate(model, carBody->position);
         model = glm::scale(model, glm::vec3(scaleFactor));
         model = glm::rotate(model, angle, glm::vec3(0.0f, 1.0f, 0.0f));
 
+        // View matrix
         glm::mat4 view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
 
         glUseProgram(shaderProgram);
@@ -979,7 +1137,7 @@ for (auto& [name, mat] : materials) {
 
         setLightingUniforms(shaderProgram, lightPos, lightColor, cameraPos);
 
-        // Draw
+        // Draw car
         glBindVertexArray(VAO);
         
         if (!groups.empty()) {
@@ -988,6 +1146,13 @@ for (auto& [name, mat] : materials) {
                 auto it = materials.find(group.materialName);
                 if (it != materials.end()) {
                     setMaterialUniforms(shaderProgram, it->second);
+                } else {
+                    Material defaultMat;
+                    defaultMat.diffuse = glm::vec3(1.0f, 0.5f, 0.0f);
+                    defaultMat.ambient = glm::vec3(0.3f, 0.2f, 0.0f);
+                    defaultMat.specular = glm::vec3(0.5f, 0.5f, 0.5f);
+                    defaultMat.shininess = 32.0f;
+                    setMaterialUniforms(shaderProgram, defaultMat);
                 }
                 
                 glDrawElements(GL_TRIANGLES, group.indices.size(), GL_UNSIGNED_INT, 
@@ -996,6 +1161,20 @@ for (auto& [name, mat] : materials) {
             }
         } else {
             glDrawElements(GL_TRIANGLES, indices.size(), GL_UNSIGNED_INT, 0);
+        }
+
+        // Physics debug rendering
+        if (showPhysicsDebug) {
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+            static int frameCount = 0;
+            if (frameCount++ % 60 == 0) {
+                std::cout << "Car pos: " << carBody->position.x << ", " 
+                          << carBody->position.y << ", " << carBody->position.z << std::endl;
+                std::cout << "Car velocity: " << carBody->velocity.x << ", " 
+                          << carBody->velocity.y << ", " << carBody->velocity.z << std::endl;
+                std::cout << "Grounded: " << (carBody->isGrounded ? "YES" : "NO") << std::endl;
+            }
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         }
 
         glfwSwapBuffers(window);
