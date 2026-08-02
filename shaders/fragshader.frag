@@ -6,12 +6,18 @@ in vec2 TexCoord;
 
 out vec4 FragColor;
 
+// Material uniforms
 uniform vec3 materialAmbient;
 uniform vec3 materialDiffuse;
 uniform vec3 materialSpecular;
 uniform float materialShininess;
 uniform float materialTransparency;
 
+// Texture uniforms
+uniform sampler2D diffuseTexture;
+uniform bool hasDiffuseTexture;
+
+// Lighting
 uniform vec3 lightPos;
 uniform vec3 lightColor;
 uniform vec3 viewPos;
@@ -22,13 +28,19 @@ void main()
     vec3 lightDir = normalize(lightPos - FragPos);
     vec3 viewDir = normalize(viewPos - FragPos);
     
+    // Get diffuse color from texture if available
+    vec3 diffuseColor = materialDiffuse;
+    if (hasDiffuseTexture) {
+        diffuseColor *= texture(diffuseTexture, TexCoord).rgb;
+    }
+    
     // Ambient
     float ambientStrength = 0.4f;
-    vec3 ambient = ambientStrength * lightColor * materialAmbient;
+    vec3 ambient = ambientStrength * lightColor * materialAmbient * diffuseColor;
     
     // Diffuse
     float diff = max(dot(norm, lightDir), 0.0);
-    vec3 diffuse = diff * lightColor * materialDiffuse;
+    vec3 diffuse = diff * lightColor * diffuseColor;
     
     // Specular
     float specularStrength = 0.6f;
