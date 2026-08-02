@@ -945,8 +945,10 @@ int main()
                 std::cout << "  ✗ FAILED: Could not load texture for " << name << std::endl;
                 // Fallback colors
                 if (name.find("Glass") != std::string::npos) {
-                    mat.diffuse = glm::vec3(0.2f, 0.6f, 0.9f);
-                    mat.transparency = 0.06f;
+                    mat.diffuse = glm::vec3(0.0f, 0.0f, 0.0f);                              
+                    mat.transparency = 0.15f;                        // 85% transparent (0.0 = fully transparent, 1.0 = opaque)
+                    mat.hasTexture = false;
+                    std::cout << "Glass fixed: black glass" << std::endl;
                 } else {
                     mat.diffuse = glm::vec3(0.9f, 0.2f, 0.1f);
                 }
@@ -954,7 +956,7 @@ int main()
         } else {
             std::cout << "  No diffuseMap in MTL, using fallback color" << std::endl;
             if (name.find("Glass") != std::string::npos) {
-                mat.diffuse = glm::vec3(0.2f, 0.6f, 0.9f);
+                mat.diffuse = glm::vec3(0.0f, 0.0f, 0.0f);
                 mat.transparency = 0.06f;
             } else {
                 mat.diffuse = glm::vec3(0.9f, 0.2f, 0.1f);
@@ -1062,6 +1064,13 @@ int main()
     float lastFrame = 0.0f;
     bool showPhysicsDebug = false;
 
+    float carSpeed = 0.0f;
+    float carMaxSpeed = 20.0f;        // Lightning fast!
+    float carAcceleration = 15.0f;    // Instant acceleration
+    float carDeceleration = 8.0f;     // Smooth deceleration
+    float carTurnSpeed = 3.0f;         // Responsive steering
+    float carRotation = 0.0f;
+
     while (!glfwWindowShouldClose(window)) {
         float currentFrame = glfwGetTime();
         float deltaTime = currentFrame - lastFrame;
@@ -1078,37 +1087,64 @@ int main()
         }
 
         // ====== CAR CONTROLS ======
-        float acceleration = 30.0f;  // How fast the car speeds up
-        float maxSpeed = 50.0f;      // Maximum speed
-        float turnSpeed = 20.0f;     // Turning speed
+
+        float carSize = glm::length(overallAABB.getSize());
+        float targetSize = 5.0f;
+        float scaleFactor = targetSize / carSize;
+
+        float carSpeed = 0.0f;
+        float carMaxSpeed = 20.0f;        // Lightning fast!
+        float carAcceleration = 15.0f;    // Instant acceleration
+        float carDeceleration = 8.0f;     // Smooth deceleration
+        float carTurnSpeed = 3.0f;         // Responsive steering
+        float carRotation = 0.0f;
 
         // Forward / Backward
         if (glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS) {
-            carBody->velocity += glm::vec3(0.0f, 0.0f, -acceleration) * deltaTime;
+            carSpeed += carAcceleration * deltaTime;
+            if (carSpeed > carMaxSpeed) carSpeed = carMaxSpeed;
         }
-        if (glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS) {
-            carBody->velocity += glm::vec3(0.0f, 0.0f, acceleration) * deltaTime;
+        else if (glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS) {
+            carSpeed -= carAcceleration * deltaTime;
+            if (carSpeed < -carMaxSpeed * 0.5f) carSpeed = -carMaxSpeed * 0.5f;
+        }
+        else {
+            // Deceleration (coast to stop)
+            if (carSpeed > 0.0f) {
+                carSpeed -= carDeceleration * deltaTime;
+                if (carSpeed < 0.0f) carSpeed = 0.0f;
+            }
+            else if (carSpeed < 0.0f) {
+                carSpeed += carDeceleration * deltaTime;
+                if (carSpeed > 0.0f) carSpeed = 0.0f;
+            }
         }
 
-        // Left / Right (strafe)
-        if (glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS) {
-            carBody->velocity += glm::vec3(-turnSpeed, 0.0f, 0.0f) * deltaTime;
+        // Turning (uses car rotation, NOT strafe)
+        float speedFactor = glm::clamp(std::abs(carSpeed) / carMaxSpeed, 0.0f, 1.0f);
+
+        if (glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS && std::abs(carSpeed) > 1.0f) {
+            float direction = (carSpeed > 0) ? 1.0f : -1.0f;
+            carRotation += carTurnSpeed * deltaTime * direction * (0.5f + 0.5f * speedFactor);
         }
-        if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS) {
-            carBody->velocity += glm::vec3(turnSpeed, 0.0f, 0.0f) * deltaTime;
+        if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS && std::abs(carSpeed) > 1.0f) {
+            float direction = (carSpeed > 0) ? 1.0f : -1.0f;
+            carRotation -= carTurnSpeed * deltaTime * direction * (0.5f + 0.5f * speedFactor);
         }
 
         // Jump
         if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS && carBody->isGrounded) {
-            carBody->velocity.y = 20.0f;
+            carBody->velocity.y = 30.0f;   // High jump for fast car
             carBody->isGrounded = false;
         }
 
-        // Clamp speed to maxSpeed
-        float speed = glm::length(carBody->velocity);
-        if (speed > maxSpeed) {
-            carBody->velocity = glm::normalize(carBody->velocity) * maxSpeed;
-        }
+        // Apply velocity in the direction the car is facing
+        glm::vec3 forward = glm::vec3(0.0f, 0.0f, 1.0f);
+        glm::mat4 rotMatrix = glm::rotate(glm::mat4(1.0f), carRotation, glm::vec3(0.0f, 1.0f, 0.0f));
+        forward = glm::vec3(rotMatrix * glm::vec4(forward, 0.0f));
+        carBody->velocity.x = forward.x * carSpeed;
+        carBody->velocity.z = forward.z * carSpeed;
+
         // Physics
         physics.update(deltaTime);
 
@@ -1120,11 +1156,10 @@ int main()
         float angle = time * 0.3f;
 
         // Model matrix using physics position
-        float scaleFactor = 0.02f;
         glm::mat4 model = glm::mat4(1.0f);
         model = glm::translate(model, carBody->position);
         model = glm::scale(model, glm::vec3(scaleFactor));
-        model = glm::rotate(model, angle, glm::vec3(0.0f, 1.0f, 0.0f));
+        model = glm::rotate(model, carRotation, glm::vec3(0.0f, 1.0f, 0.0f));
 
         // View matrix
         glm::mat4 view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
