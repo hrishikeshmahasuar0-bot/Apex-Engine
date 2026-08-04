@@ -1164,11 +1164,15 @@ int main()
         // View matrix
         glm::mat4 view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
 
+        // MVP
+        glm::mat4 mvp = projection * view * model;
+
         glUseProgram(shaderProgram);
 
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(model));
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "mvp"), GL_FALSE, glm:::value_ptr(mvp));
 
         setLightingUniforms(shaderProgram, lightPos, lightColor, cameraPos);
 
